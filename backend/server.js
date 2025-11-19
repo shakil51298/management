@@ -327,7 +327,15 @@ app.get('/api/customers/:id', (req, res) => {
   
   const customerQuery = "SELECT * FROM customers WHERE id = ?";
   const billsQuery = "SELECT * FROM bills WHERE customer_id = ? ORDER BY bill_date DESC";
-  const paymentsQuery = "SELECT * FROM payments WHERE customer_id = ? ORDER BY payment_date DESC";
+  const paymentsQuery = `
+    SELECT p.*, a.name as agent_name, a.type as agent_type, 
+           b.account_name as bank_account_name, b.bank_name, b.currency as bank_currency
+    FROM payments p 
+    LEFT JOIN agents a ON p.agent_id = a.id 
+    LEFT JOIN bank_accounts b ON p.bank_account_id = b.id
+    WHERE p.customer_id = ? 
+    ORDER BY p.payment_date DESC
+  `;
   const supplierPaymentsQuery = `
     SELECT st.*, s.name as supplier_name 
     FROM supplier_transactions st 
@@ -955,53 +963,136 @@ app.delete('/api/bills/:id', (req, res) => {
 // ==================== PAYMENT ROUTES ====================
 
 // Create new payment
+
 app.post('/api/payments', (req, res) => {
-  const { customer_id, agent_id, supplier_id, payment_date, amount, currency, type } = req.body;
+  const { customer_id, agent_id, bank_account_id, supplier_id, payment_date, amount, currency, type, notes, agent_rate } = req.body;
   
-  db.run(
-    "INSERT INTO payments (customer_id, agent_id, supplier_id, payment_date, amount, currency, type) VALUES (?, ?, ?, ?, ?, ?, ?)",
-    [customer_id, agent_id, supplier_id, payment_date, amount, currency || 'aed', type || 'customer_payment'],
-    function(err) {
-      if (err) {
-        res.status(400).json({ error: err.message });
-        return;
+  db.serialize(() => {
+    // Insert the payment
+    db.run(
+      "INSERT INTO payments (customer_id, agent_id, bank_account_id, supplier_id, payment_date, amount, currency, type, notes, agent_rate) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+      [customer_id, agent_id, bank_account_id, supplier_id, payment_date, amount, currency || 'bdt', type || 'customer_payment', notes || '', agent_rate || null],
+      function(err) {
+        if (err) {
+          res.status(400).json({ error: err.message });
+          return;
+        }
+        
+        const paymentId = this.lastID;
+        
+        // If payment is to bank account, update bank balance
+        if (bank_account_id) {
+          db.run(
+            "UPDATE bank_accounts SET balance = balance + ? WHERE id = ?",
+            [amount, bank_account_id],
+            function(err) {
+              if (err) {
+                console.error('Error updating bank balance:', err);
+                // Still return success for payment, but log the bank update error
+              }
+              
+              res.json({ 
+                id: paymentId,
+                message: 'Payment recorded and bank balance updated successfully'
+              });
+            }
+          );
+        } else {
+          res.json({ 
+            id: paymentId,
+            message: 'Payment recorded successfully'
+          });
+        }
       }
-      res.json({ 
-        id: this.lastID,
-        message: 'Payment recorded successfully'
-      });
-    }
-  );
+    );
+  });
 });
+
 
 // Update payment
 app.put('/api/payments/:id', (req, res) => {
   const { id } = req.params;
-  const { customer_id, agent_id, supplier_id, payment_date, amount, currency, type } = req.body;
+  const { customer_id, agent_id, bank_account_id, supplier_id, payment_date, amount, currency, type, notes, agent_rate, old_bank_account_id, old_amount } = req.body;
   
-  db.run(
-    "UPDATE payments SET customer_id = ?, agent_id = ?, supplier_id = ?, payment_date = ?, amount = ?, currency = ?, type = ? WHERE id = ?",
-    [customer_id, agent_id, supplier_id, payment_date, amount, currency, type, id],
-    function(err) {
-      if (err) {
-        res.status(400).json({ error: err.message });
-        return;
-      }
-      res.json({ message: 'Payment updated successfully' });
+  db.serialize(() => {
+    // First revert old bank balance if it existed
+    if (old_bank_account_id && old_amount) {
+      db.run(
+        "UPDATE bank_accounts SET balance = balance - ? WHERE id = ?",
+        [old_amount, old_bank_account_id],
+        function(err) {
+          if (err) {
+            console.error('Error reverting old bank balance:', err);
+          }
+        }
+      );
     }
-  );
+    
+    // Update the payment
+    db.run(
+      "UPDATE payments SET customer_id = ?, agent_id = ?, bank_account_id = ?, supplier_id = ?, payment_date = ?, amount = ?, currency = ?, type = ?, notes = ?, agent_rate = ? WHERE id = ?",
+      [customer_id, agent_id, bank_account_id, supplier_id, payment_date, amount, currency, type, notes, agent_rate, id],
+      function(err) {
+        if (err) {
+          res.status(400).json({ error: err.message });
+          return;
+        }
+        
+        // If new payment is to bank account, update bank balance
+        if (bank_account_id) {
+          db.run(
+            "UPDATE bank_accounts SET balance = balance + ? WHERE id = ?",
+            [amount, bank_account_id],
+            function(err) {
+              if (err) {
+                console.error('Error updating bank balance:', err);
+              }
+              
+              res.json({ message: 'Payment updated and bank balance adjusted successfully' });
+            }
+          );
+        } else {
+          res.json({ message: 'Payment updated successfully' });
+        }
+      }
+    );
+  });
 });
 
 // Delete payment
 app.delete('/api/payments/:id', (req, res) => {
   const { id } = req.params;
   
-  db.run("DELETE FROM payments WHERE id = ?", id, function(err) {
+  // First get payment details to check if it was to a bank account
+  db.get("SELECT bank_account_id, amount FROM payments WHERE id = ?", [id], (err, payment) => {
     if (err) {
       res.status(400).json({ error: err.message });
       return;
     }
-    res.json({ message: 'Payment deleted successfully' });
+    
+    db.serialize(() => {
+      // If payment was to bank account, revert the balance
+      if (payment && payment.bank_account_id) {
+        db.run(
+          "UPDATE bank_accounts SET balance = balance - ? WHERE id = ?",
+          [payment.amount, payment.bank_account_id],
+          function(err) {
+            if (err) {
+              console.error('Error reverting bank balance:', err);
+            }
+          }
+        );
+      }
+      
+      // Delete the payment
+      db.run("DELETE FROM payments WHERE id = ?", [id], function(err) {
+        if (err) {
+          res.status(400).json({ error: err.message });
+          return;
+        }
+        res.json({ message: 'Payment deleted successfully' });
+      });
+    });
   });
 });
 
