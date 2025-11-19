@@ -88,23 +88,25 @@ function initializeDatabase() {
   });
 
   // 5. Supplier transactions table
-  db.run(`CREATE TABLE IF NOT EXISTS supplier_transactions (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    supplier_id INTEGER,
-    customer_id INTEGER,
-    transaction_date DATE DEFAULT CURRENT_DATE,
-    rmb_amount REAL,
-    usdt_rate REAL,
-    calculated_usdt REAL,
-    type TEXT CHECK(type IN ('supplier_to_me', 'me_to_supplier')),
-    notes TEXT,
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-    FOREIGN KEY (supplier_id) REFERENCES suppliers (id),
-    FOREIGN KEY (customer_id) REFERENCES customers (id)
-  )`, (err) => {
-    if (err) console.error('Error creating supplier_transactions table:', err);
-    else console.log('Supplier transactions table created');
-  });
+  // Update supplier_transactions table:
+db.run(`CREATE TABLE IF NOT EXISTS supplier_transactions (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  supplier_id INTEGER,
+  customer_id INTEGER,
+  transaction_date DATE DEFAULT CURRENT_DATE,
+  rmb_amount REAL,
+  currency_type TEXT DEFAULT 'usdt',
+  currency_rate REAL,
+  calculated_amount REAL,
+  type TEXT CHECK(type IN ('supplier_to_me', 'me_to_supplier')),
+  notes TEXT,
+  created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+  FOREIGN KEY (supplier_id) REFERENCES suppliers (id),
+  FOREIGN KEY (customer_id) REFERENCES customers (id)
+)`, (err) => {
+  if (err) console.error('Error creating supplier_transactions table:', err);
+  else console.log('Supplier transactions table created');
+});
 
   // 6. Bills table
   db.run(`CREATE TABLE IF NOT EXISTS bills (
@@ -162,6 +164,22 @@ function initializeDatabase() {
   setTimeout(() => {
     insertSampleData();
   }, 500);
+
+  // In initializeDatabase() function, update the suppliers table:
+db.run(`CREATE TABLE IF NOT EXISTS suppliers (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  name TEXT NOT NULL,
+  contact_person TEXT,
+  phone TEXT,
+  email TEXT,
+  rmb_to_usdt_rate REAL DEFAULT 7.2,
+  last_currency TEXT DEFAULT 'usdt',
+  last_rate REAL DEFAULT 7.2,
+  created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+)`, (err) => {
+  if (err) console.error('Error creating suppliers table:', err);
+  else console.log('Suppliers table created');
+});
 }
 
 function insertSampleData() {
@@ -597,15 +615,15 @@ app.delete('/api/agents/:id', (req, res) => {
 // Get all suppliers with balance information
 app.get('/api/suppliers', (req, res) => {
   const query = `
-    SELECT s.*,
-           COALESCE(SUM(CASE WHEN st.type = 'supplier_to_me' THEN st.calculated_usdt ELSE 0 END), 0) as total_rmb_received,
-           COALESCE(SUM(CASE WHEN st.type = 'me_to_supplier' THEN st.calculated_usdt ELSE 0 END), 0) as total_usdt_paid,
-           COALESCE(SUM(CASE WHEN st.type = 'supplier_to_me' THEN st.calculated_usdt ELSE -st.calculated_usdt END), 0) as net_balance
-    FROM suppliers s
-    LEFT JOIN supplier_transactions st ON s.id = st.supplier_id
-    GROUP BY s.id
-    ORDER BY s.created_at DESC
-  `;
+  SELECT s.*,
+         COALESCE(SUM(CASE WHEN st.type = 'supplier_to_me' THEN st.calculated_amount ELSE 0 END), 0) as total_rmb_received,
+         COALESCE(SUM(CASE WHEN st.type = 'me_to_supplier' THEN st.calculated_amount ELSE 0 END), 0) as total_usdt_paid,
+         COALESCE(SUM(CASE WHEN st.type = 'supplier_to_me' THEN st.calculated_amount ELSE -st.calculated_amount END), 0) as net_balance
+  FROM suppliers s
+  LEFT JOIN supplier_transactions st ON s.id = st.supplier_id
+  GROUP BY s.id
+  ORDER BY s.created_at DESC
+`;
   
   db.all(query, (err, rows) => {
     if (err) {
@@ -670,11 +688,11 @@ app.get('/api/suppliers/:id', (req, res) => {
 
 // Create new supplier
 app.post('/api/suppliers', (req, res) => {
-  const { name, contact_person, phone, email, rmb_to_usdt_rate } = req.body;
+  const { name, contact_person, phone, email, rmb_to_usdt_rate, last_currency, last_rate } = req.body;
   
   db.run(
-    "INSERT INTO suppliers (name, contact_person, phone, email, rmb_to_usdt_rate) VALUES (?, ?, ?, ?, ?)",
-    [name, contact_person, phone, email, rmb_to_usdt_rate || 7.2],
+    "INSERT INTO suppliers (name, contact_person, phone, email, rmb_to_usdt_rate, last_currency, last_rate) VALUES (?, ?, ?, ?, ?, ?, ?)",
+    [name, contact_person, phone, email, rmb_to_usdt_rate || 7.2, last_currency || 'usdt', last_rate || 7.2],
     function(err) {
       if (err) {
         res.status(400).json({ error: err.message });
@@ -691,11 +709,11 @@ app.post('/api/suppliers', (req, res) => {
 // Update supplier
 app.put('/api/suppliers/:id', (req, res) => {
   const { id } = req.params;
-  const { name, contact_person, phone, email, rmb_to_usdt_rate } = req.body;
+  const { name, contact_person, phone, email, rmb_to_usdt_rate, last_currency, last_rate } = req.body;
   
   db.run(
-    "UPDATE suppliers SET name = ?, contact_person = ?, phone = ?, email = ?, rmb_to_usdt_rate = ? WHERE id = ?",
-    [name, contact_person, phone, email, rmb_to_usdt_rate, id],
+    "UPDATE suppliers SET name = ?, contact_person = ?, phone = ?, email = ?, rmb_to_usdt_rate = ?, last_currency = ?, last_rate = ? WHERE id = ?",
+    [name, contact_person, phone, email, rmb_to_usdt_rate, last_currency, last_rate, id],
     function(err) {
       if (err) {
         res.status(400).json({ error: err.message });
@@ -724,22 +742,39 @@ app.delete('/api/suppliers/:id', (req, res) => {
 
 // ==================== SUPPLIER TRANSACTION ROUTES ====================
 
-// Create supplier transaction
+// In POST /api/supplier-transactions route - FIX THE FIELD NAMES:
 app.post('/api/supplier-transactions', (req, res) => {
-  const { supplier_id, customer_id, transaction_date, rmb_amount, usdt_rate, calculated_usdt, type, notes } = req.body;
+  const { supplier_id, customer_id, transaction_date, rmb_amount, currency_type, currency_rate, calculated_amount, type, notes } = req.body;
   
+  console.log('Received transaction data:', req.body); // Add this for debugging
+  
+  // First update supplier's last used currency and rate
   db.run(
-    "INSERT INTO supplier_transactions (supplier_id, customer_id, transaction_date, rmb_amount, usdt_rate, calculated_usdt, type, notes) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-    [supplier_id, customer_id, transaction_date, rmb_amount, usdt_rate, calculated_usdt, type, notes],
+    "UPDATE suppliers SET last_currency = ?, last_rate = ? WHERE id = ?",
+    [currency_type, currency_rate, supplier_id],
     function(err) {
       if (err) {
+        console.error('Error updating supplier:', err);
         res.status(400).json({ error: err.message });
         return;
       }
-      res.json({ 
-        id: this.lastID,
-        message: 'Supplier transaction recorded successfully'
-      });
+      
+      // Then create the transaction
+      db.run(
+        "INSERT INTO supplier_transactions (supplier_id, customer_id, transaction_date, rmb_amount, currency_type, currency_rate, calculated_amount, type, notes) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        [supplier_id, customer_id, transaction_date, rmb_amount, currency_type, currency_rate, calculated_amount, type, notes],
+        function(err) {
+          if (err) {
+            console.error('Error creating transaction:', err);
+            res.status(400).json({ error: err.message });
+            return;
+          }
+          res.json({ 
+            id: this.lastID,
+            message: 'Supplier transaction recorded successfully'
+          });
+        }
+      );
     }
   );
 });
